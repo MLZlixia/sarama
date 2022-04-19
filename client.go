@@ -13,47 +13,49 @@ import (
 // automatically when it passes out of scope. It is safe to share a client amongst many
 // users, however Kafka will process requests from a single client strictly in serial,
 // so it is generally more efficient to use the default one client per producer/consumer.
+
+// client是一个通用的kafka客户端，管理一个或者多个与kafka的broker的连接。
+// 必须对客户端调用Close()避免内存泄漏，当他超出范围，不会自动对其垃圾进行回收。
+// 在多个用户之间共享一个客户端是安全的，但是kafka将严格一串行方式处理来自单个客户端的请求
+// 因此通常更高效地使用默认的每个生产者/消费者一个客户端。
 type Client interface {
-	// Config returns the Config struct of the client. This struct should not be
-	// altered after it has been created.
+	// 访问kafka的client的配置
 	Config() *Config
 
-	// Controller returns the cluster controller broker. It will return a
-	// locally cached value if it's available. You can call RefreshController
-	// to update the cached value. Requires Kafka 0.10 or higher.
+	// 控制器返回集群代理，如果可用，将返回一个本地缓存的值。您可以调用RefreshController来更新缓存的值。
+	// 要求kafka0.10或更高。
 	Controller() (*Broker, error)
 
-	// RefreshController retrieves the cluster controller from fresh metadata
-	// and stores it in the local cache. Requires Kafka 0.10 or higher.
+	// RefreshController从新的元数据中检索集群控制器，并将其存储在本地缓存中。要求kafka0.10或更高。
 	RefreshController() (*Broker, error)
 
-	// Brokers returns the current set of active brokers as retrieved from cluster metadata.
+	// Brokers 返回从集群元数据检索到的当前的broker集合
 	Brokers() []*Broker
 
-	// Broker returns the active Broker if available for the broker ID.
+	// Broker 根据brokerID返回broker
 	Broker(brokerID int32) (*Broker, error)
 
-	// Topics returns the set of available topics as retrieved from cluster metadata.
+	// Topics 返回从集群元数据中获得的可用的主题.
 	Topics() ([]string, error)
 
-	// Partitions returns the sorted list of all partition IDs for the given topic.
+	// Partitions 返回给定主题的所有分区ID的排序列表.
 	Partitions(topic string) ([]int32, error)
 
 	// WritablePartitions returns the sorted list of all writable partition IDs for
 	// the given topic, where "writable" means "having a valid leader accepting
 	// writes".
+
+	// 返回给定主题的所有可写分区ID的排序列表，其中“writable”表示
+	// “具有接受写入的leader副本”。
 	WritablePartitions(topic string) ([]int32, error)
 
-	// Leader returns the broker object that is the leader of the current
-	// topic/partition, as determined by querying the cluster metadata.
+	// 返回当前主题/分区的leader副本，查询集群的元数据得到
 	Leader(topic string, partitionID int32) (*Broker, error)
 
-	// Replicas returns the set of all replica IDs for the given partition.
+	// 返回给定分区的副本分区的id
 	Replicas(topic string, partitionID int32) ([]int32, error)
 
-	// InSyncReplicas returns the set of all in-sync replica IDs for the given
-	// partition. In-sync replicas are replicas which are fully caught up with
-	// the partition leader.
+	// 返回给定分区的所有同步副本(ISR)的id集合，in-sync副本是完全赶上分区leader的副本。
 	InSyncReplicas(topic string, partitionID int32) ([]int32, error)
 
 	// OfflineReplicas returns the set of all offline replica IDs for the given
@@ -65,25 +67,21 @@ type Client interface {
 	// will be used for the next metadata fetch.
 	RefreshBrokers(addrs []string) error
 
-	// RefreshMetadata takes a list of topics and queries the cluster to refresh the
-	// available metadata for those topics. If no topics are provided, it will refresh
-	// metadata for all topics.
+	// RefreshMetadata获取主题列表，并查询集群以刷新这些主题的可用元数据。
+	// 如果没有提供主题，它将刷新所有主题的元数据。
 	RefreshMetadata(topics ...string) error
 
-	// GetOffset queries the cluster to get the most recent available offset at the
-	// given time (in milliseconds) on the topic/partition combination.
-	// Time should be OffsetOldest for the earliest available offset,
-	// OffsetNewest for the offset of the message that will be produced next, or a time.
+	/*
+		GetOffset查询集群，以获取主题/分区组合在给定时间（以毫秒为单位）的最新可用偏移量。
+		对于最早的可用偏移量，时间是OffsetOldest；对于下一次生成的消息的偏移量时间是OffsetNewest。
+	*/
 	GetOffset(topic string, partitionID int32, time int64) (int64, error)
 
-	// Coordinator returns the coordinating broker for a consumer group. It will
-	// return a locally cached value if it's available. You can call
-	// RefreshCoordinator to update the cached value. This function only works on
-	// Kafka 0.8.2 and higher.
+	// 返回消费者组的协调broker，如果可用，将会返回一个本地缓存的值。我们可以调用RefreshCoordinator来更新缓存的值
+	// 此方法仅适用于kafka的0.8.2及其更高版本。
 	Coordinator(consumerGroup string) (*Broker, error)
 
-	// RefreshCoordinator retrieves the coordinator for a consumer group and stores it
-	// in local cache. This function only works on Kafka 0.8.2 and higher.
+	// RefreshCoordinator检索消费者组的协调器并将其存储在本地缓存中。此函数仅适用于卡夫卡0.8.2及更高版本。
 	RefreshCoordinator(consumerGroup string) error
 
 	// InitProducerID retrieves information required for Idempotent Producer
@@ -100,15 +98,11 @@ type Client interface {
 }
 
 const (
-	// OffsetNewest stands for the log head offset, i.e. the offset that will be
-	// assigned to the next message that will be produced to the partition. You
-	// can send this to a client's GetOffset method to get this offset, or when
-	// calling ConsumePartition to start consuming new messages.
+	// OffsetNewst代表日志尾偏移量，即将分配给将生成到分区的下一条消息的偏移量。
+	// 您可以将其发送到客户端的GetOffset方法以获取该偏移量，或者在调用ConsumePartition开始使用新消息时发送。
 	OffsetNewest int64 = -1
-	// OffsetOldest stands for the oldest offset available on the broker for a
-	// partition. You can send this to a client's GetOffset method to get this
-	// offset, or when calling ConsumePartition to start consuming from the
-	// oldest offset that is still available on the broker.
+	// OffsetOldest代表一个分区在代理上可用的最早的偏移量。
+	// 您可以将其发送到客户端的GetOffset方法以获取该偏移量，或者在调用ConsumePartition以从代理上仍然可用的最旧偏移量开始消费时发送。
 	OffsetOldest int64 = -2
 )
 
@@ -433,9 +427,11 @@ func (client *client) Leader(topic string, partitionID int32) (*Broker, error) {
 		return nil, ErrClosedClient
 	}
 
+	// 在元数据缓存中获取当前的leader副本
 	leader, err := client.cachedLeader(topic, partitionID)
 
 	if leader == nil {
+		// 如果不存在则刷新主题对应的元数据
 		err = client.RefreshMetadata(topic)
 		if err != nil {
 			return nil, err
@@ -574,9 +570,11 @@ func (client *client) Coordinator(consumerGroup string) (*Broker, error) {
 		return nil, ErrClosedClient
 	}
 
+	// 从client缓存中获取一个consumerGroup的协调器的broker
 	coordinator := client.cachedCoordinator(consumerGroup)
 
 	if coordinator == nil {
+		// 在缓存中不存在，拉取元数据获取Coordinator缓存在本地
 		if err := client.RefreshCoordinator(consumerGroup); err != nil {
 			return nil, err
 		}
@@ -587,6 +585,7 @@ func (client *client) Coordinator(consumerGroup string) (*Broker, error) {
 		return nil, ErrConsumerCoordinatorNotAvailable
 	}
 
+	// 协调器和client进行连接
 	_ = coordinator.Open(client.conf)
 	return coordinator, nil
 }

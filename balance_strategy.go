@@ -22,9 +22,8 @@ const (
 	defaultGeneration = -1
 )
 
-// BalanceStrategyPlan is the results of any BalanceStrategy.Plan attempt.
-// It contains an allocation of topic/partitions by memberID in the form of
-// a `memberID -> topic -> partitions` map.
+// 平衡策略结果的map
+// 包含的按照memberId分配的主题/分区, 形式为`memberID->topic->partitions`的map
 type BalanceStrategyPlan map[string]map[string][]int32
 
 // Add assigns a topic with a number partitions to a member.
@@ -40,52 +39,52 @@ func (p BalanceStrategyPlan) Add(memberID, topic string, partitions ...int32) {
 
 // --------------------------------------------------------------------
 
-// BalanceStrategy is used to balance topics and partitions
-// across members of a consumer group
+// BalanceStrategy用于再平衡消费者组成员之间的主题和分区
 type BalanceStrategy interface {
-	// Name uniquely identifies the strategy.
+	// 策略的名称
 	Name() string
 
-	// Plan accepts a map of `memberID -> metadata` and a map of `topic -> partitions`
-	// and returns a distribution plan.
+	// Plan接受“memberID->metadata”的映射和“topic->partitions”的映射，并返回分发计划。
 	Plan(members map[string]ConsumerGroupMemberMetadata, topics map[string][]int32) (BalanceStrategyPlan, error)
 
-	// AssignmentData returns the serialized assignment data for the specified
-	// memberID
+	// AssignmentData返回指定memberID的序列化分配数据
 	AssignmentData(memberID string, topics map[string][]int32, generationID int32) ([]byte, error)
 }
 
 // --------------------------------------------------------------------
-
-// BalanceStrategyRange is the default and assigns partitions as ranges to consumer group members.
-// Example with one topic T with six partitions (0..5) and two members (M1, M2):
-//   M1: {T: [0, 1, 2]}
-//   M2: {T: [3, 4, 5]}
+// BalanceStrategyRange(轮询策略)是默认值， 并将分区轮询分给消费者组成员。
+// 一个主题T带有六个分区（0..5）和两个成员（M1，M2）的示例：
+// M1: {T: [0, 1, 2]}
+//  M2: {T: [3, 4, 5]}
 var BalanceStrategyRange = &balanceStrategy{
 	name: RangeBalanceStrategyName,
 	coreFn: func(plan BalanceStrategyPlan, memberIDs []string, topic string, partitions []int32) {
-		step := float64(len(partitions)) / float64(len(memberIDs))
+		// 每次从partitions分区中切割[i*setp:(i+1)step]=>指派给对应的成员
 
+		// 如对于2个成员，3个分区。step=1.5
+		step := float64(len(partitions)) / float64(len(memberIDs))
+		// 此时min=0, max=2, 则member1分配partitions[0:2], member2分配[2:3]
+		// 如此分配几轮则member会出现消费者过载，member2可能会消费者不足。除了选择其他策略我们也可以再平衡策略
 		for i, memberID := range memberIDs {
 			pos := float64(i)
 			min := int(math.Floor(pos*step + 0.5))
 			max := int(math.Floor((pos+1)*step + 0.5))
+			// 保存分配的结果
 			plan.Add(memberID, topic, partitions[min:max]...)
 		}
 	},
 }
 
-// BalanceStrategySticky assigns partitions to members with an attempt to preserve earlier assignments
-// while maintain a balanced partition distribution.
-// Example with topic T with six partitions (0..5) and two members (M1, M2):
+// BalanceStrategyStick将分区分配给成员，试图保留以前的分配，同时保持分区分布的平衡。
+// 主题T有六个分区（0..5）和两个成员（M1，M2）的示例:
 //   M1: {T: [0, 2, 4]}
 //   M2: {T: [1, 3, 5]}
 //
-// On reassignment with an additional consumer, you might get an assignment plan like:
+// 在与其他消费者重新分配任务时，您可能会得到如下分配计划：:
 //   M1: {T: [0, 2]}
 //   M2: {T: [1, 3]}
 //   M3: {T: [4, 5]}
-//
+// 此种算法称为黏性算法，也就是尽量保留以前的结果，减少再分配带来的所有权变化。
 var BalanceStrategySticky = &stickyBalanceStrategy{}
 
 // --------------------------------------------------------------------
@@ -100,7 +99,7 @@ func (s *balanceStrategy) Name() string { return s.name }
 
 // Plan implements BalanceStrategy.
 func (s *balanceStrategy) Plan(members map[string]ConsumerGroupMemberMetadata, topics map[string][]int32) (BalanceStrategyPlan, error) {
-	// Build members by topic map
+	// 获取主题下有哪些成员订阅
 	mbt := make(map[string][]string)
 	for memberID, meta := range members {
 		for _, topic := range meta.Topics {
@@ -108,7 +107,8 @@ func (s *balanceStrategy) Plan(members map[string]ConsumerGroupMemberMetadata, t
 		}
 	}
 
-	// Sort members for each topic
+	// 对订阅同一个主题的members进行排序
+	// 进行排序之后id较小的会排在前边，则分配的对应主题的分区可能会多一些
 	for topic, memberIDs := range mbt {
 		sort.Sort(&balanceStrategySortable{
 			topic:     topic,
@@ -116,9 +116,10 @@ func (s *balanceStrategy) Plan(members map[string]ConsumerGroupMemberMetadata, t
 		})
 	}
 
-	// Assemble plan
 	plan := make(BalanceStrategyPlan, len(members))
 	for topic, memberIDs := range mbt {
+		// 同一个主题的分区=>分配到订阅此主题的分组成员下(活跃的consumer)
+		// 此种形式分配，当主题内的分区不均匀时
 		s.coreFn(plan, memberIDs, topic, topics[topic])
 	}
 	return plan, nil
@@ -163,25 +164,25 @@ func (s *stickyBalanceStrategy) Name() string { return StickyBalanceStrategyName
 
 // Plan implements BalanceStrategy.
 func (s *stickyBalanceStrategy) Plan(members map[string]ConsumerGroupMemberMetadata, topics map[string][]int32) (BalanceStrategyPlan, error) {
-	// track partition movements during generation of the partition assignment plan
+	// 在生成分区分配计划期间跟踪分区移动
 	s.movements = partitionMovements{
 		Movements:                 make(map[topicPartitionAssignment]consumerPair),
 		PartitionMovementsByTopic: make(map[string]map[consumerPair]map[topicPartitionAssignment]bool),
 	}
 
-	// prepopulate the current assignment state from userdata on the consumer group members
+	// 从用户组的userdata中预填充当前分配状态
 	currentAssignment, prevAssignment, err := prepopulateCurrentAssignments(members)
 	if err != nil {
 		return nil, err
 	}
 
-	// determine if we're dealing with a completely fresh assignment, or if there's existing assignment state
+	// 此布尔值确定我们是处理的全新的任务还是现在的任务
 	isFreshAssignment := false
 	if len(currentAssignment) == 0 {
 		isFreshAssignment = true
 	}
 
-	// create a mapping of all current topic partitions and the consumers that can be assigned to them
+	// 创建所有当前主题分区和可分配给它们的consumer的map
 	partition2AllPotentialConsumers := make(map[topicPartitionAssignment][]string)
 	for topic, partitions := range topics {
 		for _, partition := range partitions {
@@ -189,15 +190,17 @@ func (s *stickyBalanceStrategy) Plan(members map[string]ConsumerGroupMemberMetad
 		}
 	}
 
-	// create a mapping of all consumers to all potential topic partitions that can be assigned to them
-	// also, populate the mapping of partitions to potential consumers
+	// 创建一个所有消费者到所有潜在主题分区的映射，也可以分配给他们，填充分区到潜在消费者的映射
 	consumer2AllPotentialPartitions := make(map[string][]topicPartitionAssignment, len(members))
 	for memberID, meta := range members {
 		consumer2AllPotentialPartitions[memberID] = make([]topicPartitionAssignment, 0)
+		// 遍历用户订阅的主题
 		for _, topicSubscription := range meta.Topics {
-			// only evaluate topic subscriptions that are present in the supplied topics map
+			// 仅评估存在的topic的map中存在的订阅的topic
 			if _, found := topics[topicSubscription]; found {
+				// 是consumer订阅的topic
 				for _, partition := range topics[topicSubscription] {
+					// 取出订阅的topic中的分区然后存储
 					topicPartition := topicPartitionAssignment{Topic: topicSubscription, Partition: partition}
 					consumer2AllPotentialPartitions[memberID] = append(consumer2AllPotentialPartitions[memberID], topicPartition)
 					partition2AllPotentialConsumers[topicPartition] = append(partition2AllPotentialConsumers[topicPartition], memberID)
@@ -205,50 +208,55 @@ func (s *stickyBalanceStrategy) Plan(members map[string]ConsumerGroupMemberMetad
 			}
 		}
 
-		// add this consumer to currentAssignment (with an empty topic partition assignment) if it does not already exist
+		// 如果此consumer不存在，请将其添加到currentAssignment（主题分区分配为空）
 		if _, exists := currentAssignment[memberID]; !exists {
 			currentAssignment[memberID] = make([]topicPartitionAssignment, 0)
 		}
 	}
 
-	// create a mapping of each partition to its current consumer, where possible
+	// 创建分区到其当前使用者的map结构
 	currentPartitionConsumers := make(map[topicPartitionAssignment]string, len(currentAssignment))
+	// 没有被访问的分区
 	unvisitedPartitions := make(map[topicPartitionAssignment]bool, len(partition2AllPotentialConsumers))
 	for partition := range partition2AllPotentialConsumers {
 		unvisitedPartitions[partition] = true
 	}
+	// 没有被分配的分区
 	var unassignedPartitions []topicPartitionAssignment
 	for memberID, partitions := range currentAssignment {
 		var keepPartitions []topicPartitionAssignment
 		for _, partition := range partitions {
-			// If this partition no longer exists at all, likely due to the
-			// topic being deleted, we remove the partition from the member.
+			// 如果这个分区根本不存在，很可能是因为主题被删除了，我们会从成员中删除这个分区。
 			if _, exists := partition2AllPotentialConsumers[partition]; !exists {
 				continue
 			}
+			// 从未访问的分区中删除，这个分区已经被分配
 			delete(unvisitedPartitions, partition)
+			// 存储当前分区到member的id映射
 			currentPartitionConsumers[partition] = memberID
 
 			if !strsContains(members[memberID].Topics, partition.Topic) {
+				// 主题没有被分配给此member，consumer不订阅此主题，存储到没有被分配的分区列表
 				unassignedPartitions = append(unassignedPartitions, partition)
 				continue
 			}
+			// 当前活跃的member依然订阅的分区
 			keepPartitions = append(keepPartitions, partition)
 		}
+		// 保存consumer依然订阅的分区列表
 		currentAssignment[memberID] = keepPartitions
 	}
 	for unvisited := range unvisitedPartitions {
 		unassignedPartitions = append(unassignedPartitions, unvisited)
 	}
 
-	// sort the topic partitions in order of priority for reassignment
+	// 按照重新分配的优先级对主题分区进行排序
 	sortedPartitions := sortPartitions(currentAssignment, prevAssignment, isFreshAssignment, partition2AllPotentialConsumers, consumer2AllPotentialPartitions)
 
-	// at this point we have preserved all valid topic partition to consumer assignments and removed
-	// all invalid topic partitions and invalid consumers. Now we need to assign unassignedPartitions
-	// to consumers so that the topic partition assignments are as balanced as possible.
+	// 此时，我们保留了所有有效的主题分区到consumer的分配，并删除了所有无效的主题分区和无效consumer。
+	// 现在我们需要将未分配的分区分配consumer，以便主题分区分配尽可能平衡。
+	// 根据已经分配给消费者的主题分区的数量，对消费者进行升序排序
 
-	// an ascending sorted set of consumers based on how many topic partitions are already assigned to them
 	sortedCurrentSubscriptions := sortMemberIDsByPartitionAssignments(currentAssignment)
 	s.balance(currentAssignment, prevAssignment, sortedPartitions, unassignedPartitions, sortedCurrentSubscriptions, consumer2AllPotentialPartitions, partition2AllPotentialConsumers, currentPartitionConsumers)
 
@@ -611,7 +619,7 @@ func assignPartition(partition topicPartitionAssignment, sortedCurrentSubscripti
 	return sortMemberIDsByPartitionAssignments(currentAssignment)
 }
 
-// Deserialize topic partition assignment data to aid with creation of a sticky assignment.
+// 反序列化主题/分区分配数据，以帮助创建粘性分配
 func deserializeTopicPartitionAssignment(userDataBytes []byte) (StickyAssignorUserData, error) {
 	userDataV1 := &StickyAssignorUserDataV1{}
 	if err := decode(userDataBytes, userDataV1); err != nil {
@@ -624,19 +632,20 @@ func deserializeTopicPartitionAssignment(userDataBytes []byte) (StickyAssignorUs
 	return userDataV1, nil
 }
 
-// filterAssignedPartitions returns a map of consumer group members to their list of previously-assigned topic partitions, limited
-// to those topic partitions currently reported by the Kafka cluster.
+// FilterAsignedPartitions 返回现在和之前都订阅的consumer和分区的映射
+// 仅限于Kafka集群当前报告的主题分区。
 func filterAssignedPartitions(currentAssignment map[string][]topicPartitionAssignment, partition2AllPotentialConsumers map[topicPartitionAssignment][]string) map[string][]topicPartitionAssignment {
 	assignments := deepCopyAssignment(currentAssignment)
 	for memberID, partitions := range assignments {
-		// perform in-place filtering
 		i := 0
 		for _, partition := range partitions {
 			if _, exists := partition2AllPotentialConsumers[partition]; exists {
+				// consumer之前也订阅此分区
 				partitions[i] = partition
 				i++
 			}
 		}
+		// 现在和之前consumer都被分配的分区的交集
 		assignments[memberID] = partitions[:i]
 	}
 	return assignments
@@ -668,22 +677,21 @@ func sortPartitions(currentAssignment map[string][]topicPartitionAssignment, par
 
 	sortedPartitions := make([]topicPartitionAssignment, 0)
 	if !isFreshAssignment && areSubscriptionsIdentical(partition2AllPotentialConsumers, consumer2AllPotentialPartitions) {
-		// if this is a reassignment and the subscriptions are identical (all consumers can consumer from all topics)
-		// then we just need to simply list partitions in a round robin fashion (from consumers with
-		// most assigned partitions to those with least)
+		// 如果这是一次重新分配，并且订阅是相同的（所有消费者都可以从所有主题中消费），
+		// 那么我们只需要以循环方式列出分区（从分配分区最多的消费者到分配分区最少的消费者）
 		assignments := filterAssignedPartitions(currentAssignment, partition2AllPotentialConsumers)
 
-		// use priority-queue to evaluate consumer group members in descending-order based on
-		// the number of topic partition assignments (i.e. consumers with most assignments first)
+		// 使用优先级队列根据主题分区分配的数量降序评估消费者组成员（即首先是分配最多的消费者）
 		pq := make(assignmentPriorityQueue, len(assignments))
 		i := 0
 		for consumerID, consumerAssignments := range assignments {
 			pq[i] = &consumerGroupMember{
-				id:          consumerID,
-				assignments: consumerAssignments,
+				id:          consumerID,          // 消费者id
+				assignments: consumerAssignments, // 消费者被分配的分区
 			}
 			i++
 		}
+		// 在堆中初始化地址
 		heap.Init(&pq)
 
 		for {
@@ -693,18 +701,22 @@ func sortPartitions(currentAssignment map[string][]topicPartitionAssignment, par
 			}
 			member := pq[0]
 
-			// partitions that were assigned to a different consumer last time
+			// 查找上次分配的分区在交集中的位置
 			var prevPartitionIndex int
 			for i, partition := range member.assignments {
 				if _, exists := partitionsWithADifferentPreviousAssignment[partition]; exists {
+					// 查找到排在最前边的直接退出循环
 					prevPartitionIndex = i
 					break
 				}
 			}
 
 			if len(member.assignments) > 0 {
+				// 取出被分配给其他consumer的分区
 				partition := member.assignments[prevPartitionIndex]
 				sortedPartitions = append(sortedPartitions, partition)
+
+				// 删除对应的分区
 				delete(unassignedPartitions, partition)
 				if prevPartitionIndex == 0 {
 					member.assignments = member.assignments[1:]
@@ -772,6 +784,9 @@ func deepCopyAssignment(assignment map[string][]topicPartitionAssignment) map[st
 	return m
 }
 
+// 查看订阅是否是相同的
+// 所有consumer=>订阅相同的主题
+// 所有consumer被分配相同的分区
 func areSubscriptionsIdentical(partition2AllPotentialConsumers map[topicPartitionAssignment][]string, consumer2AllPotentialPartitions map[string][]topicPartitionAssignment) bool {
 	curMembers := make(map[string]int)
 	for _, cur := range partition2AllPotentialConsumers {
@@ -825,21 +840,23 @@ func areSubscriptionsIdentical(partition2AllPotentialConsumers map[topicPartitio
 	return true
 }
 
-// We need to process subscriptions' user data with each consumer's reported generation in mind
-// higher generations overwrite lower generations in case of a conflict
-// note that a conflict could exist only if user data is for different generations
+// 我们需要处理订阅的用户数据时，考虑到每个消费者报告的代数，考虑到发生冲突的情况下，高代会覆盖低代。
+// 注意只有当用户数据用于不同的代时，才会存在冲突
 func prepopulateCurrentAssignments(members map[string]ConsumerGroupMemberMetadata) (map[string][]topicPartitionAssignment, map[topicPartitionAssignment]consumerGenerationPair, error) {
 	currentAssignment := make(map[string][]topicPartitionAssignment)
 	prevAssignment := make(map[topicPartitionAssignment]consumerGenerationPair)
 
-	// for each partition we create a sorted map of its consumers by generation
+	// 对于每个分区，我们按代创建其消费者的排序图
 	sortedPartitionConsumersByGeneration := make(map[topicPartitionAssignment]map[int]string)
 	for memberID, meta := range members {
 		consumerUserData, err := deserializeTopicPartitionAssignment(meta.UserData)
 		if err != nil {
 			return nil, nil, err
 		}
+
+		// 用户订阅的分区  以分区key-代-用于的订阅id的映射
 		for _, partition := range consumerUserData.partitions() {
+			// 本代内用户订阅的分区已经存在
 			if consumers, exists := sortedPartitionConsumersByGeneration[partition]; exists {
 				if consumerUserData.hasGeneration() {
 					if _, generationExists := consumers[consumerUserData.generation()]; generationExists {
@@ -848,9 +865,11 @@ func prepopulateCurrentAssignments(members map[string]ConsumerGroupMemberMetadat
 						Logger.Printf("Topic %s Partition %d is assigned to multiple consumers following sticky assignment generation %d", partition.Topic, partition.Partition, consumerUserData.generation())
 						continue
 					} else {
+						// 如果存在消费者按代存储对应的成员id
 						consumers[consumerUserData.generation()] = memberID
 					}
 				} else {
+					// 不存在代使用默认存储
 					consumers[defaultGeneration] = memberID
 				}
 			} else {
@@ -863,25 +882,30 @@ func prepopulateCurrentAssignments(members map[string]ConsumerGroupMemberMetadat
 		}
 	}
 
-	// prevAssignment holds the prior ConsumerGenerationPair (before current) of each partition
-	// current and previous consumers are the last two consumers of each partition in the above sorted map
+	// prevAssignment保存每个分区的前一个ConsumerGenerationPair
+	// currentAssignment存储当前consumer
+	// 当前和以前的消费者是上述排序映射中每个分区的最后两个消费者
 	for partition, consumers := range sortedPartitionConsumersByGeneration {
-		// sort consumers by generation in decreasing order
+		// 按照代对消费者进行降序排序
 		var generations []int
 		for generation := range consumers {
 			generations = append(generations, generation)
 		}
 		sort.Sort(sort.Reverse(sort.IntSlice(generations)))
 
+		// 取出最小的消费者id 当期的订阅的consumer
 		consumer := consumers[generations[0]]
 		if _, exists := currentAssignment[consumer]; !exists {
+			// 不存在创建添加
 			currentAssignment[consumer] = []topicPartitionAssignment{partition}
 		} else {
+			// 当前consumer订阅的分区，直接拼接
 			currentAssignment[consumer] = append(currentAssignment[consumer], partition)
 		}
 
 		// check for previous assignment, if any
 		if len(generations) > 1 {
+			// 存储每个分区的前一个订阅者
 			prevAssignment[partition] = consumerGenerationPair{
 				MemberID:   consumers[generations[1]],
 				Generation: generations[1],

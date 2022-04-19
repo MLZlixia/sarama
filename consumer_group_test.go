@@ -23,10 +23,8 @@ func (h *handler) ConsumeClaim(sess ConsumerGroupSession, claim ConsumerGroupCla
 	return nil
 }
 
-// TestConsumerGroupNewSessionDuringOffsetLoad ensures that the consumer group
-// will retry Join and Sync group operations, if it receives a temporary
-// OffsetsLoadInProgress error response, in the same way as it would for a
-// RebalanceInProgress.
+// TestConsumerGroupNewSessionDuringOffsetLoad 如果消费者组临时收到OffsetsLoadInProcess错误响应,
+// 消费者组将重试加入和同步操组操作，方法与重新平衡过程相同。
 func TestConsumerGroupNewSessionDuringOffsetLoad(t *testing.T) {
 	config := NewTestConfig()
 	config.ClientID = t.Name()

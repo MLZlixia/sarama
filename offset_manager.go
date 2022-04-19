@@ -71,6 +71,7 @@ func newOffsetManagerFromClient(group, memberID string, generation int32, client
 		closed:  make(chan none),
 	}
 	if conf.Consumer.Offsets.AutoCommit.Enable {
+		// 定时自动提交
 		om.ticker = time.NewTicker(conf.Consumer.Offsets.AutoCommit.Interval)
 		go withRecover(om.mainLoop)
 	}
@@ -235,6 +236,7 @@ func (om *offsetManager) mainLoop() {
 	for {
 		select {
 		case <-om.ticker.C:
+			// 实现的定时自动提交
 			om.Commit()
 		case <-om.closing:
 			return

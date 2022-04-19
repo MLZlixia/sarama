@@ -17,32 +17,19 @@ var ErrClosedConsumerGroup = errors.New("kafka: tried to use a consumer group th
 // ConsumerGroup is responsible for dividing up processing of topics and partitions
 // over a collection of processes (the members of the consumer group).
 type ConsumerGroup interface {
-	// Consume joins a cluster of consumers for a given list of topics and
-	// starts a blocking ConsumerGroupSession through the ConsumerGroupHandler.
+	// Consumer 加入给定主题列表的消费者集群, 并通过ConsumerGroupHandler启动阻塞ConsumerGroupSession
+	// session 的生命周期由一下步骤决定
+	// 1 消费者加入集群，触发分区再分配
+	// 2 处理开始前调用handler的Setup的hook来通知调用者，并运行调用者对状态做有必要的修改。
+	// 3 对于每个分配的claims,处理程序的consumerClaim()函数将在一个单独的goroutine中调用，该goroutine要求它是线程安全的。必须小心保护任何状态，防止并发读/写。
+	// 4 session将持续，直到其中一个consumerClaim()函数退出。这可以是在取消父上下文时，也可以是在启动服务器端重新平衡循环时。
+	// 5 一旦所有consumerClaim()循环退出，就会调用处理程序的Cleanup()钩子，以允许用户在重新平衡之前做某些必要操作(比如提交offset)。
+	// 6 在claims释放之前，最后一次提交offset标记
 	//
-	// The life-cycle of a session is represented by the following steps:
-	//
-	// 1. The consumers join the group (as explained in https://kafka.apache.org/documentation/#intro_consumers)
-	//    and is assigned their "fair share" of partitions, aka 'claims'.
-	// 2. Before processing starts, the handler's Setup() hook is called to notify the user
-	//    of the claims and allow any necessary preparation or alteration of state.
-	// 3. For each of the assigned claims the handler's ConsumeClaim() function is then called
-	//    in a separate goroutine which requires it to be thread-safe. Any state must be carefully protected
-	//    from concurrent reads/writes.
-	// 4. The session will persist until one of the ConsumeClaim() functions exits. This can be either when the
-	//    parent context is canceled or when a server-side rebalance cycle is initiated.
-	// 5. Once all the ConsumeClaim() loops have exited, the handler's Cleanup() hook is called
-	//    to allow the user to perform any final tasks before a rebalance.
-	// 6. Finally, marked offsets are committed one last time before claims are released.
-	//
-	// Please note, that once a rebalance is triggered, sessions must be completed within
-	// Config.Consumer.Group.Rebalance.Timeout. This means that ConsumeClaim() functions must exit
-	// as quickly as possible to allow time for Cleanup() and the final offset commit. If the timeout
-	// is exceeded, the consumer will be removed from the group by Kafka, which will cause offset
-	// commit failures.
-	// This method should be called inside an infinite loop, when a
-	// server-side rebalance happens, the consumer session will need to be
-	// recreated to get the new claims.
+	// 一旦触发再平衡session必须在Config.Consumer.Group.Rebalance.Timeout时间内完成，
+	// 这意味着ConsumerClaim()必须尽快退出，以便有时间进行Cleanup()和最终偏移量的提交。
+	// 如果超过超时时间，kafka会将consumer从组中移除，从而提交失败。
+	// 应该在无限循环中调用此方法，当服务器端重新平衡时，需要重新创建者consumer的session以获得新的claims。
 	Consume(ctx context.Context, topics []string, handler ConsumerGroupHandler) error
 
 	// Errors returns a read channel of errors that occurred during the consumer life-cycle.
@@ -55,14 +42,12 @@ type ConsumerGroup interface {
 	// this function before the object passes out of scope, as it will otherwise leak memory.
 	Close() error
 
-	// Pause suspends fetching from the requested partitions. Future calls to the broker will not return any
-	// records from these partitions until they have been resumed using Resume()/ResumeAll().
-	// Note that this method does not affect partition subscription.
-	// In particular, it does not cause a group rebalance when automatic assignment is used.
+	// 暂停对指定分区的请求。在使用Resume()/ResumeAll()恢复这些分区之前，broker不会从这些分区返回任何数据。
+	// 此方法不影响分区订阅，当使用自动分配时，不会导致组重新平衡。
 	Pause(partitions map[string][]int32)
 
-	// Resume resumes specified partitions which have been paused with Pause()/PauseAll().
-	// New calls to the broker will return records from these partitions if there are any to be fetched.
+	// Resume 恢复使用Pause（）/PauseAll（）暂停的指定分区。
+	// broker将返回这些分区的数据
 	Resume(partitions map[string][]int32)
 
 	// Pause suspends fetching from all partitions. Future calls to the broker will not return any
@@ -183,7 +168,7 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 		return fmt.Errorf("no topics provided")
 	}
 
-	// Refresh metadata for requested topics
+	// 刷新指定topic的集群的元数据
 	if err := c.client.RefreshMetadata(topics...); err != nil {
 		return err
 	}
@@ -196,15 +181,16 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 		return err
 	}
 
-	// loop check topic partition numbers changed
-	// will trigger rebalance when any topic partitions number had changed
-	// avoid Consume function called again that will generate more than loopCheckPartitionNumbers coroutine
+	/*
+		当任何主题分区号发生更改时，loop check topic partition number changed（循环检查主题分区号更改）将触发重新平衡避免再次调用函数，
+		该函数将生成超过LoopCheckPartitionNumber（循环检查主题分区号）的协程
+	*/
 	go c.loopCheckPartitionNumbers(topics, sess)
 
-	// Wait for session exit signal
+	// 等待结束的信号
 	<-sess.ctx.Done()
 
-	// Gracefully release session claims
+	// session释放
 	return sess.release(true)
 }
 
@@ -246,6 +232,12 @@ func (c *consumerGroup) retryNewSession(ctx context.Context, topics []string, ha
 }
 
 func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler ConsumerGroupHandler, retries int) (*consumerGroupSession, error) {
+	// 获群组协调器(不同群组可以有不同的协调器)
+	// consumer向协调器发送心跳来维持他们和群组的从属关系，以及对分区的所有权关系
+	// 对应于本client，会开启异步心跳检测，不会阻塞消息的轮序
+	// 正常时间内心跳=>consumer活跃
+	// 过长时间心跳=> consumer的session过期=>consumer死亡=>触发再平衡
+
 	coordinator, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		if retries <= 0 {
@@ -271,8 +263,11 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Join consumer group
+	// 加入消费者群组，向群组协调器发送一个joinGroup请求。
+	// 第一个加入加入群组的消费者是"群主"
 	join, err := c.joinGroupRequest(coordinator, topics)
 	if consumerGroupJoinTotal != nil {
+		// 加入消费者群组的总数+1
 		consumerGroupJoinTotal.Inc(1)
 	}
 	if err != nil {
@@ -304,14 +299,17 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		return nil, join.Err
 	}
 
-	// Prepare distribution plan if we joined as the leader
+	// 如果是以leader的身份加入的，触发给每个分组成员重新分配分区
 	var plan BalanceStrategyPlan
 	if join.LeaderId == join.MemberId {
+		// 以leader身份加入，也就是群主
+		// 获取所有活跃的成员, 根据元数据解析的本地缓存
 		members, err := join.GetMembers()
 		if err != nil {
 			return nil, err
 		}
 
+		// 对分区和成员的所有权，按照在平衡策略生成新的分配计划
 		plan, err = c.balance(members)
 		if err != nil {
 			return nil, err
@@ -319,6 +317,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Sync consumer group
+	// 把在平衡计划发送到分组协调器，触发再一次平衡
 	groupRequest, err := c.syncGroupRequest(coordinator, plan, join.GenerationId)
 	if consumerGroupSyncTotal != nil {
 		consumerGroupSyncTotal.Inc(1)
@@ -355,15 +354,14 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	// Retrieve and sort claims
 	var claims map[string][]int32
 	if len(groupRequest.MemberAssignment) > 0 {
+		// 获取再平衡之后分区和consumer的分配关系
 		members, err := groupRequest.GetMemberAssignment()
 		if err != nil {
 			return nil, err
 		}
-		claims = members.Topics
+		claims = members.Topics // 主题和分区的对应关系
 
-		// in the case of stateful balance strategies, hold on to the returned
-		// assignment metadata, otherwise, reset the statically defined conusmer
-		// group metadata
+		// 在有状态平衡策略的情况下，保留返回的分配元数据，否则，重置静态定义的conusmer组元数据
 		if members.UserData != nil {
 			c.userData = members.UserData
 		} else {
@@ -371,10 +369,12 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		}
 
 		for _, partitions := range claims {
+			// 对分区进行排序
 			sort.Sort(int32Slice(partitions))
 		}
 	}
 
+	// 创建一个新的consumer会话，memberid，加入的新的consumer
 	return newConsumerGroupSession(ctx, c, claims, join.MemberId, join.GenerationId, handler)
 }
 
@@ -629,12 +629,13 @@ type consumerGroupSession struct {
 
 func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims map[string][]int32, memberID string, generationID int32, handler ConsumerGroupHandler) (*consumerGroupSession, error) {
 	// init offset manager
+	// 获取一个新的offsetManager管理器
 	offsets, err := newOffsetManagerFromClient(parent.groupID, memberID, generationID, parent.client)
 	if err != nil {
 		return nil, err
 	}
 
-	// init context
+	// 这里方便及时关闭所有的群组
 	ctx, cancel := context.WithCancel(ctx)
 
 	// init session
@@ -652,11 +653,14 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// start heartbeat loop
+	// 异步心跳检测，保证协调器和consumer的通信，检测consumer存活
 	go sess.heartbeatLoop()
 
-	// create a POM for each claim
+	// create a POM for each claim， 这里claims是再平衡之后的
+	// 创建每一个claim的对象模型
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
+			// 对主题和分区进行管理
 			pom, err := offsets.ManagePartition(topic, partition)
 			if err != nil {
 				_ = sess.release(false)
@@ -673,26 +677,28 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// perform setup
+	// consumer从broker获取消息之前调用handler.Setup,来通知调用者做必要的处理
 	if err := handler.Setup(sess); err != nil {
 		_ = sess.release(true)
 		return nil, err
 	}
 
-	// start consuming
+	// 消费拉取所有的数据
 	for topic, partitions := range claims {
+
+		// 每个成员分配的主题和分区，异步拉取
 		for _, partition := range partitions {
 			sess.waitGroup.Add(1)
 
 			go func(topic string, partition int32) {
 				defer sess.waitGroup.Done()
 
-				// cancel the as session as soon as the first
-				// goroutine exits
+				// 拉取第一个分区之后立即取消会话
 				defer sess.cancel()
 
-				// consume a single topic/partition, blocking
+				// 阻塞拉取，单个主题或者分区
 				sess.consume(topic, partition)
-			}(topic, partition)
+			}(topic, partition) // => 以分区为维度进行异步拉取
 		}
 	}
 	return sess, nil
@@ -728,6 +734,7 @@ func (s *consumerGroupSession) Context() context.Context {
 
 func (s *consumerGroupSession) consume(topic string, partition int32) {
 	// quick exit if rebalance is due
+	// 正在在平衡直接退出
 	select {
 	case <-s.ctx.Done():
 		return
@@ -736,13 +743,13 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 	default:
 	}
 
-	// get next offset
+	// 获取需要拉取message的offset
 	offset := s.parent.config.Consumer.Offsets.Initial
 	if pom := s.offsets.findPOM(topic, partition); pom != nil {
 		offset, _ = pom.NextOffset()
 	}
 
-	// create new claim
+	// 创建一个新的claim并订阅主题，拉取数据
 	claim, err := newConsumerGroupClaim(s, topic, partition, offset)
 	if err != nil {
 		s.parent.handleError(err, topic, partition)
@@ -765,12 +772,12 @@ func (s *consumerGroupSession) consume(topic string, partition int32) {
 		claim.AsyncClose()
 	}()
 
-	// start processing
+	// 拉取的消息传入handler.ConsumeClaim函数处理
 	if err := s.handler.ConsumeClaim(s, claim); err != nil {
 		s.parent.handleError(err, topic, partition)
 	}
 
-	// ensure consumer is closed & drained
+	// 数据处理完毕，异步关闭，处理遗留的错误和元信息
 	claim.AsyncClose()
 	for _, err := range claim.waitClosed() {
 		s.parent.handleError(err, topic, partition)
@@ -786,6 +793,7 @@ func (s *consumerGroupSession) release(withCleanup bool) (err error) {
 
 	// perform release
 	s.releaseOnce.Do(func() {
+		// 本次执行完毕
 		if withCleanup {
 			if e := s.handler.Cleanup(s); e != nil {
 				s.parent.handleError(e, "", -1)
@@ -808,6 +816,10 @@ func (s *consumerGroupSession) release(withCleanup bool) (err error) {
 	return
 }
 
+// 检测consumer的是否可达，这里使用Group.Heartbeat.Interval作为健康检查的时间
+// 使用Metadata.Retry.Backoff作为阻塞的时间，如果阻塞时间到retries--
+// 如果连接关闭直接返回
+// 发生错误重试
 func (s *consumerGroupSession) heartbeatLoop() {
 	defer close(s.hbDead)
 	defer s.cancel() // trigger the end of the session on exit
@@ -884,16 +896,14 @@ func (s *consumerGroupSession) heartbeatLoop() {
 // PLEASE NOTE that handlers are likely be called from several goroutines concurrently,
 // ensure that all state is safely protected against race conditions.
 type ConsumerGroupHandler interface {
-	// Setup is run at the beginning of a new session, before ConsumeClaim.
+	// 在session开始之前调用
 	Setup(ConsumerGroupSession) error
 
-	// Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
-	// but before the offsets are committed for the very last time.
+	// 清理在会话结束时运行，一旦所有ConsumerClaim Goroutine退出，但在最后一次提交偏移量之前。
 	Cleanup(ConsumerGroupSession) error
 
-	// ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
-	// Once the Messages() channel is closed, the Handler must finish its processing
-	// loop and exit.
+	// ConsumerClaim必须启动ConsumerGroupClaim消息（）的消费者循环。
+	// 一旦Messages（）通道关闭，处理程序必须完成其处理循环并退出。
 	ConsumeClaim(ConsumerGroupSession, ConsumerGroupClaim) error
 }
 
@@ -929,11 +939,13 @@ type consumerGroupClaim struct {
 }
 
 func newConsumerGroupClaim(sess *consumerGroupSession, topic string, partition int32, offset int64) (*consumerGroupClaim, error) {
+	// 订阅主题，开启监控，持续拉取指定分区的数据
 	pcm, err := sess.parent.consumer.ConsumePartition(topic, partition, offset)
 	if errors.Is(err, ErrOffsetOutOfRange) {
 		offset = sess.parent.config.Consumer.Offsets.Initial
 		pcm, err = sess.parent.consumer.ConsumePartition(topic, partition, offset)
 	}
+
 	if err != nil {
 		return nil, err
 	}

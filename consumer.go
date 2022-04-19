@@ -61,10 +61,9 @@ type Consumer interface {
 	// This method is the same as Client.Partitions(), and is provided for convenience.
 	Partitions(topic string) ([]int32, error)
 
-	// ConsumePartition creates a PartitionConsumer on the given topic/partition with
-	// the given offset. It will return an error if this Consumer is already consuming
-	// on the given topic/partition. Offset can be a literal offset, or OffsetNewest
-	// or OffsetOldest
+	// ConsumePartition在给定主题/分区上创建具有给定偏移量的PartitionConsumer
+	// 如果这个消费者已经在使用给定的主题/分区，它将返回一个错误。
+	// 偏移量可以是literal、OffsetNewest、OffsetOldest任意一种
 	ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error)
 
 	// HighWaterMarks returns the current high water marks for each topic and partition.
@@ -174,6 +173,8 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 
 	var leader *Broker
 	var err error
+
+	// 获取leader副本
 	if leader, err = c.client.Leader(child.topic, child.partition); err != nil {
 		return nil, err
 	}
@@ -183,9 +184,11 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 	}
 
 	go withRecover(child.dispatcher)
-	go withRecover(child.responseFeeder)
+	go withRecover(child.responseFeeder) // 监控broker拉取数据，放入feeder
 
+	// 由对应的leader去拉取数据
 	child.broker = c.refBrokerConsumer(leader)
+	// broker 监听需要拉取的partionconsumer
 	child.broker.input <- child
 
 	return child, nil
@@ -236,8 +239,10 @@ func (c *consumer) refBrokerConsumer(broker *Broker) *brokerConsumer {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	// 对应的leader无缓存的consumer
 	bc := c.brokerConsumers[broker]
 	if bc == nil {
+		// leader监听拉取消息
 		bc = c.newBrokerConsumer(broker)
 		c.brokerConsumers[broker] = bc
 	}
@@ -251,9 +256,11 @@ func (c *consumer) unrefBrokerConsumer(brokerWorker *brokerConsumer) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	// broker拉取kafka消息的个数
 	brokerWorker.refs--
 
 	if brokerWorker.refs == 0 {
+		// 证明leader没有在使用中，关闭broker的任务处理
 		close(brokerWorker.input)
 		if c.brokerConsumers[brokerWorker.broker] == brokerWorker {
 			delete(c.brokerConsumers, brokerWorker.broker)
@@ -344,10 +351,9 @@ func (c *consumer) ResumeAll() {
 // Close; this will signal the PartitionConsumer's goroutines to begin shutting down (just like AsyncClose), but will
 // also drain the Messages channel, harvest all errors & return them once cleanup has completed.
 type PartitionConsumer interface {
-	// AsyncClose initiates a shutdown of the PartitionConsumer. This method will return immediately, after which you
-	// should continue to service the 'Messages' and 'Errors' channels until they are empty. It is required to call this
-	// function, or Close before a consumer object passes out of scope, as it will otherwise leak memory. You must call
-	// this before calling Close on the underlying client.
+	// AsyncClose启动PartitionConsumer的关闭。此方法将立即返回，之后应继续为“Message”和“Errors”通道提供服务，直到它们为空。
+	// 需要调用此函数，或在使用者对象超出范围之前关闭，否则会泄漏内存。
+	// 在调用基础客户端上的Close之前，必须调用此函数。
 	AsyncClose()
 
 	// Close stops the PartitionConsumer from fetching messages. It will initiate a shutdown just like AsyncClose, drain
@@ -439,14 +445,17 @@ func (child *partitionConsumer) dispatcher() {
 	for range child.trigger {
 		select {
 		case <-child.dying:
+			// 退出任务，关闭接收response的trigge
 			close(child.trigger)
 		case <-time.After(child.computeBackoff()):
+			// 达到等待响应的阻塞时间
 			if child.broker != nil {
 				child.consumer.unrefBrokerConsumer(child.broker)
 				child.broker = nil
 			}
 
 			if err := child.dispatch(); err != nil {
+				// 刷新可用元数据失败，返回err
 				child.sendError(err)
 				child.trigger <- none{}
 			}
@@ -481,6 +490,7 @@ func (child *partitionConsumer) preferredBroker() (*Broker, error) {
 }
 
 func (child *partitionConsumer) dispatch() error {
+	// 刷新数据，获得一个新的broker继续fetch数据
 	if err := child.consumer.client.RefreshMetadata(child.topic); err != nil {
 		return err
 	}
@@ -498,24 +508,29 @@ func (child *partitionConsumer) dispatch() error {
 }
 
 func (child *partitionConsumer) chooseStartingOffset(offset int64) error {
+	// 获取日志头偏移量
 	newestOffset, err := child.consumer.client.GetOffset(child.topic, child.partition, OffsetNewest)
 	if err != nil {
 		return err
 	}
 
+	// 高水位 表示消费者只能拉取到此offset之前的消息
+	// 高水位是副本复制的的offset
+
 	child.highWaterMarkOffset = newestOffset
 
+	// 获取最早可用的复制的日志偏移量
 	oldestOffset, err := child.consumer.client.GetOffset(child.topic, child.partition, OffsetOldest)
 	if err != nil {
 		return err
 	}
 
 	switch {
-	case offset == OffsetNewest:
+	case offset == OffsetNewest: // 最新
 		child.offset = newestOffset
-	case offset == OffsetOldest:
+	case offset == OffsetOldest: // 最早
 		child.offset = oldestOffset
-	case offset >= oldestOffset && offset <= newestOffset:
+	case offset >= oldestOffset && offset <= newestOffset: // 指定偏移量
 		child.offset = offset
 	default:
 		return ErrOffsetOutOfRange
@@ -562,32 +577,44 @@ func (child *partitionConsumer) HighWaterMarkOffset() int64 {
 
 func (child *partitionConsumer) responseFeeder() {
 	var msgs []*ConsumerMessage
+	// consumer 允许最长等待时间
 	expiryTicker := time.NewTicker(child.conf.Consumer.MaxProcessingTime)
 	firstAttempt := true
 
 feederLoop:
+	// 从consumer的response的channel拉取数据
 	for response := range child.feeder {
+		// 获取consumerRecords中
 		msgs, child.responseResult = child.parseResponse(response)
 
 		if child.responseResult == nil {
 			atomic.StoreInt32(&child.retries, 0)
 		}
 
+		// consumerRecord
 		for i, msg := range msgs {
-			child.interceptors(msg)
+			child.interceptors(msg) // 返回之前使用拦截器处理消息
 		messageSelect:
 			select {
 			case <-child.dying:
+				// 本次获取消息结束
 				child.broker.acks.Done()
 				continue feederLoop
 			case child.messages <- msg:
+				// 获取的message传入message的缓冲区管道
 				firstAttempt = true
 			case <-expiryTicker.C:
+				// 达到或超过允许的获取message的时间
+				// 超时错误
+				// 超时
 				if !firstAttempt {
+					// 响应超时错误，
 					child.responseResult = errTimedOut
+					// consumer的群组协调器broker的
 					child.broker.acks.Done()
 				remainingLoop:
 					for _, msg = range msgs[i:] {
+						// 继续处理拉取的消息
 						child.interceptors(msg)
 						select {
 						case child.messages <- msg:
@@ -595,6 +622,7 @@ feederLoop:
 							break remainingLoop
 						}
 					}
+					// 放入待处理队列，由副本leader继续处理
 					child.broker.input <- child
 					continue feederLoop
 				} else {
@@ -868,24 +896,23 @@ func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 	}
 
 	go withRecover(bc.subscriptionManager)
+	// 异步处理订阅的consumer然后，拉取数据，并向consumer传输结果
 	go withRecover(bc.subscriptionConsumer)
 
 	return bc
 }
 
-// The subscriptionManager constantly accepts new subscriptions on `input` (even when the main subscriptionConsumer
-// goroutine is in the middle of a network request) and batches it up. The main worker goroutine picks
-// up a batch of new subscriptions between every network request by reading from `newSubscriptions`, so we give
-// it nil if no new subscriptions are available.
+// 订阅管理器不断接受“input”上的新订阅（即使当主订阅用户GueOffTID处于网络请求的中间）并分批进行。
+// 主工作程序goroutine通过读取“newSubscriptions”在每个网络请求之间获取一批新订阅，因此如果没有可用的新订阅，我们将其设为nil。
 func (bc *brokerConsumer) subscriptionManager() {
+	// 关闭订阅
 	defer close(bc.newSubscriptions)
 
+	// 增加consumer订阅的分区
 	for {
 		var partitionConsumers []*partitionConsumer
-
-		// Check for any partition consumer asking to subscribe if there aren't
-		// any, trigger the network request (to fetch Kafka messages) by sending "nil" to the
-		// newSubscriptions channel
+		// 检查是否有任何分区使用者请求订阅，
+		// 如果没有，则通过向newSubscriptions频道发送“nil”来触发网络请求（获取Kafka消息）
 		select {
 		case pc, ok := <-bc.input:
 			if !ok {
@@ -916,19 +943,21 @@ func (bc *brokerConsumer) subscriptionManager() {
 	}
 }
 
-// subscriptionConsumer ensures we will get nil right away if no new subscriptions is available
-// this is a the main loop that fetches Kafka messages
+// subscriptionConsumer确保如果没有新的订阅，我们将立即获得nil。
+// 这是一个获取kafka消息的主循环
 func (bc *brokerConsumer) subscriptionConsumer() {
 	for newSubscriptions := range bc.newSubscriptions {
+		// 更新新增加的订阅列表
 		bc.updateSubscriptions(newSubscriptions)
 
 		if len(bc.subscriptions) == 0 {
-			// We're about to be shut down or we're about to receive more subscriptions.
-			// Take a small nap to avoid burning the CPU.
+			// 如果没有订阅，休眠100ms
+			// 等待用户调阅主题和分区
 			time.Sleep(partitionConsumersBatchTimeout)
 			continue
 		}
 
+		// broker拉取kafka消息
 		response, err := bc.fetchNewMessages()
 		if err != nil {
 			Logger.Printf("consumer/broker/%d disconnecting due to error processing FetchRequest: %s\n", bc.broker.ID(), err)
@@ -938,6 +967,7 @@ func (bc *brokerConsumer) subscriptionConsumer() {
 
 		bc.acks.Add(len(bc.subscriptions))
 		for child := range bc.subscriptions {
+			// 把拉取的消息放入结果队列，等待调用者取出，放入message的channel
 			child.feeder <- response
 		}
 		bc.acks.Wait()
@@ -1077,5 +1107,6 @@ func (bc *brokerConsumer) fetchNewMessages() (*FetchResponse, error) {
 		}
 	}
 
+	// 等待broker拉取kafka元数据
 	return bc.broker.Fetch(request)
 }
